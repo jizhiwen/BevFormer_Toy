@@ -23,6 +23,7 @@ class SyntheticConfig:
     num_object_queries: int = 16
     num_foreground_classes: int = 3
     num_points_in_pillar: int = 4
+    num_decoder_points: int = 4
     pc_range: Tuple[float, float, float, float, float, float] = (-10.0, -10.0, -2.0, 10.0, 10.0, 4.0)
     active_prob: float = 0.7
     noise_std: float = 0.01
@@ -328,7 +329,10 @@ def compute_losses(
     background_class_id: int,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     pred_logits = outputs["pred_logits"]
-    pred_boxes = outputs["pred_boxes"].sigmoid()
+    pred_boxes = outputs["pred_boxes"].clone()
+    # Decoder refinement already writes normalized x/y/z into pred_boxes.
+    # The remaining size/yaw channels still come from raw regression logits.
+    pred_boxes[..., 3:] = pred_boxes[..., 3:].sigmoid()
     target_classes = batch["target_classes"]
     target_boxes = batch["target_boxes"]
 
@@ -444,6 +448,7 @@ def build_model(config: SyntheticConfig) -> ToyBEVFormer:
         num_heads=8,
         num_temporal_points=4,
         num_spatial_points=4,
+        num_decoder_points=config.num_decoder_points,
         num_object_queries=config.num_object_queries,
         num_classes=config.num_classes,
         ffn_hidden_dims=256,

@@ -129,6 +129,7 @@ def main() -> None:
         num_heads=8,
         num_temporal_points=4,
         num_spatial_points=4,
+        num_decoder_points=4,
         num_object_queries=32,
         num_classes=3,
         ffn_hidden_dims=256,

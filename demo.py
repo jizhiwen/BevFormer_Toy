@@ -22,6 +22,7 @@ def main() -> None:
         num_heads=8,
         num_temporal_points=4,
         num_spatial_points=4,
+        num_decoder_points=4,
         num_object_queries=32,
         num_classes=3,
         ffn_hidden_dims=256,
@@ -49,6 +50,7 @@ def main() -> None:
     print_tensor_summary("bev_feature", outputs_t0["bev_feature"])
     print_tensor_summary("pred_logits", outputs_t0["pred_logits"])
     print_tensor_summary("pred_boxes", outputs_t0["pred_boxes"])
+    print_tensor_summary("decoder ref points", outputs_t0["decoder_reference_points"])
     print_tensor_summary("reference_points_cam", outputs_t0["reference_points_cam"])
     print_tensor_summary("bev_mask", outputs_t0["bev_mask"])
 
@@ -57,8 +59,10 @@ def main() -> None:
 
     temporal_debug = outputs_t0["encoder_debug"][0]["temporal"]
     spatial_debug = outputs_t0["encoder_debug"][0]["spatial"]
+    decoder_debug = outputs_t0["decoder_debug"][0]
     print_tensor_summary("temporal locations", temporal_debug["sampling_locations"])
     print_tensor_summary("spatial locations", spatial_debug["sampling_locations"])
+    print_tensor_summary("decoder locations", decoder_debug["cross_sampling_locations"])
 
     print("\n=== Frame 2: with prev_bev and ego shift ===")
     next_image_feats = torch.randn(batch_size, 6, 128, 16, 16, device=device)
@@ -83,6 +87,7 @@ def main() -> None:
     print_tensor_summary("bev_feature", outputs_t1["bev_feature"])
     print_tensor_summary("pred_logits", outputs_t1["pred_logits"])
     print_tensor_summary("pred_boxes", outputs_t1["pred_boxes"])
+    print_tensor_summary("decoder ref points", outputs_t1["decoder_reference_points"])
 
     temporal_locations = outputs_t1["encoder_debug"][0]["temporal"]["sampling_locations"]
     prev_frame_refs = temporal_locations[:, :, 0]

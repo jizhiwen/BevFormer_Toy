@@ -12,7 +12,7 @@
 
 - `model.py`
   - 主模型实现
-  - 包含参考点生成、3D 投影、Temporal / Spatial attention、decoder
+  - 包含参考点生成、3D 投影、Temporal / Spatial attention、deformable decoder
 - `demo.py`
   - 随机生成多相机特征
   - 构造一组 toy 相机矩阵
@@ -51,6 +51,7 @@ python visualize_toy.py --query-idx 210 --camera-idx 0
 - `reference_points_cam` 的 shape
 - `bev_mask` 的 shape
 - temporal / spatial sampling locations 的 shape
+- decoder sampling locations 和 `decoder_reference_points` 的 shape
 - toy decoder 输出的 `pred_boxes`
 
 训练时你会看到：
@@ -77,12 +78,13 @@ python visualize_toy.py --query-idx 210 --camera-idx 0
   - 投影到多个相机
   - 只在投影位置附近做稀疏采样
 - decoder 会用 object query 从 BEV memory 中读出目标信息
+- decoder 会围绕 `reference_points` 做 deformable 采样并逐层 refine
 
 ## 这个 toy 版省略了什么
 
 - MMCV / CUDA 的 `MSDeformableAttention`
 - 多尺度 FPN 特征
-- 公版中的 `can_bus` MLP、旋转补偿、box refine cascade
+- 公版中的完整 `can_bus` MLP、旋转补偿和多阶段 box 参数化细节
 - 完整的检测训练目标和数据集管线
 
 所以它更适合回答：
@@ -104,8 +106,11 @@ python visualize_toy.py --query-idx 210 --camera-idx 0
    - `TemporalSelfAttention`
    - `SpatialCrossAttention`
 4. 再看 `visualize_toy.py`，把投影点和采样点对上
-5. 再看 `train_toy.py` 里 synthetic dataset 的生成逻辑
-6. 最后看 `ToyBEVFormer.forward()`
+5. 再看 decoder 相关模块：
+   - `DeformableDecoderCrossAttention`
+   - `DetectionDecoderLayer`
+6. 再看 `train_toy.py` 里 synthetic dataset 的生成逻辑
+7. 最后看 `ToyBEVFormer.forward()`
 
 如果你已经读过 `bevformer_tutorial_zh.md`，可以把这个 toy 实现当成那篇文档的配套代码版本。
 

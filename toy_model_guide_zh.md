@@ -337,6 +337,165 @@ toy 版为了可读性，改成了纯 PyTorch 的：
 
 ---
 
+## 6.3 从 `BEV feature` 到目标：`Detection Decoder` 到底做了什么
+
+encoder 做完以后，模型手里已经有了一张融合好的 `BEV feature map`。  
+但这张图本身还不是检测结果，它更像是一张“整理好的场景记忆”。
+
+decoder 要解决的问题是：
+
+**怎样用一组固定数量的 `object query`，从整张 `BEV feature` 里把目标一个个读出来？**
+
+你可以把它想成：
+
+- encoder 负责“把地图画出来”
+- decoder 负责“在地图上把目标读出来”
+
+toy 版里 decoder 的整体流程可以压缩成：
+
+1. 先准备一组固定数量的 `object query`
+2. 再给每个 query 一个初始 `reference_point`
+3. query 先彼此通信一次
+4. 然后围绕自己的 `reference_point` 去 `BEV memory` 上做 deformable 采样
+5. 得到更新后的 query 表示
+6. 用回归分支修正这个 query 的 `reference_point`
+7. 下一层继续重复这个过程
+8. 最后输出分类和 3D box
+
+### 6.3.1 为什么 decoder 不直接看整张 `BEV memory`
+
+如果让每个 object query 都去和整张 `BEV memory` 的所有位置做全量匹配，当然也能工作，但会有两个问题：
+
+1. 计算更重
+2. 缺少“这个 query 现在应该重点看哪里”的显式几何锚点
+
+现在 toy 版 decoder 改成 deformable 之后，思路就变成：
+
+- 先给 query 一个默认中心 `reference_point`
+- 再只在这个中心附近采少量点
+- 用这些稀疏采样结果更新 query
+
+所以 decoder 的 cross-attention 不再是：
+
+```text
+query -> 和整段 memory 全量做匹配
+```
+
+而更像：
+
+```text
+query -> 先有一个默认落点 -> 再只看这个落点附近几个位置
+```
+
+### 6.3.2 `obj_query` 和 `obj_query_pos` 分别是什么
+
+这两个张量 shape 很像，但职责不同：
+
+- `obj_query`
+  - query 当前携带的“内容状态”
+  - 会在每层 decoder 里不断被更新
+- `obj_query_pos`
+  - query 的“身份先验 / 位置先验”
+  - 更像这个 query 自带的固定标签
+
+在 toy 版里，`obj_query_pos` 还有一个很重要的作用：
+
+**它会先通过 `reference_point_head` 生成 decoder 的初始 `reference_points`。**
+
+所以你可以把它理解成：
+
+- `obj_query`：这个侦探当前掌握了什么信息
+- `obj_query_pos`：这个侦探默认站在哪里、属于哪个槽位
+
+### 6.3.3 为什么每层都要更新 `reference_points`
+
+因为一开始给的 `reference_point` 只是一个初始猜测，不一定准。
+
+如果某一层 decoder 读完 `BEV memory` 后发现：
+
+- 目标中心应该再往左一点
+- 高度应该再高一点
+
+那它就应该把这个参考点修正一下，再交给下一层继续看。
+
+所以 decoder 的层间关系不是：
+
+```text
+每层都从零开始重新猜
+```
+
+而是：
+
+```text
+上一层给一个更好的位置猜测
+-> 下一层围绕这个更好的位置继续采样
+-> 再继续 refine
+```
+
+这也是为什么它特别像“逐层打磨 box”。
+
+### 6.3.4 toy 版 decoder 每层具体在干什么
+
+对单层 decoder 来说，可以按下面顺序理解：
+
+1. `self-attention`
+   - 先让 object queries 之间彼此交换信息
+2. deformable cross-attention
+   - 每个 query 围绕当前 `reference_point` 在 `BEV memory` 上采样
+3. FFN
+   - 再做一次通道维度上的非线性变换
+4. regression branch
+   - 用这一层更新后的 query 去预测 box delta
+5. refine reference point
+   - 把 box delta 写回 `reference_points`
+
+这里要特别注意：
+
+- `box_deltas` 不是最终 box
+- 它更像“当前层建议把框往哪里修一点”的增量
+- toy 版里只用它的前 3 维去 refine `reference_points`
+  - `[..., 0:2]` 对应 `x, y`
+  - `[..., 2:3]` 对应 `z`
+
+所以一层 decoder 结束后，真正变了两样东西：
+
+- query 表示变了
+- `reference_points` 也变了
+
+### 6.3.5 最后 `pred_boxes` 和 `reference_points` 是什么关系
+
+在 toy 版里，最终 box 预测头还是会输出一个 7 维 box。  
+但 decoder 逐层 refine 出来的 `reference_points` 会直接写回 box 的关键位置维度。
+
+当前 toy 版里 `pred_boxes` 的 7 维可以这样理解：
+
+- `0:2`
+  - 最终使用 decoder 多层 refine 后的 `reference_points[..., :2]`
+  - 对应归一化 `x, y`
+- `2:3`
+  - 最终使用 decoder 多层 refine 后的 `reference_points[..., 2:3]`
+  - 对应归一化 `z`
+- `3:7`
+  - 仍然来自最后的 `box_head(decoded)`
+  - 对应 `dx, dy, dz, yaw`
+
+可以把它理解成：
+
+- `box_head`
+  - 负责输出尺寸和姿态等剩余 box 参数
+- `reference_points`
+  - 负责提供“逐层 refine 后的中心/高度落点”
+
+所以最后的 `pred_boxes` 并不是纯靠最后一个线性层一次性瞎猜出来的，而是带着 decoder 多层 refine 过的位置先验。
+
+### 6.3.6 一句最直白的总结
+
+decoder 的本质就是：
+
+**用固定数量的 object queries，在 BEV 地图上围绕各自的参考点反复读信息、反复修正位置，最后把目标一个个读出来。**
+
+---
+
 ## 7. `sample_from_feature_map()` 到底在干什么
 
 这是 toy 版里最像“deformable sampling 核心”的函数。
@@ -569,7 +728,23 @@ toy 版训练目标很简单：
 - `dz`
 - `yaw`
 
-训练时会对 `pred_boxes` 先做 `sigmoid()`，然后和归一化后的 GT box 做 L1。
+不过当前 toy 版已经不是“7 维全都先直接 `sigmoid()` 再算损失”了。
+
+因为 decoder 会把 refine 后的 `reference_points` 直接写回 `pred_boxes` 的前 3 维，所以训练时的处理是：
+
+- `x, y, z`
+  - 已经是归一化后的坐标
+  - 直接参与 `L1 loss`
+- `dx, dy, dz, yaw`
+  - 仍然是原始回归 logits
+  - 先做 `sigmoid()` 再参与 `L1 loss`
+
+所以这一步本质上是在对齐当前代码里的约定：
+
+```text
+pred_boxes[..., :3]    -> 直接用
+pred_boxes[..., 3:7]   -> 先 sigmoid 再用
+```
 
 ### 10.3 总损失
 
@@ -826,19 +1001,33 @@ ffn -> residual
 
 ### 13.9 `DetectionDecoderLayer`
 
-toy 版里 decoder 故意简化成标准 `nn.MultiheadAttention`。
+现在的 toy 版 decoder 不再是“普通 cross-attention 读整段 memory”，而是更接近公版的两段式结构：
 
-作用是：
+- 保留 object query 内部的 `self-attention`
+- 把 `query -> BEV memory` 的 cross-attention 改成基于 `reference_points` 的 deformable 采样
+- 每层后面再接一个回归分支，用来更新 `reference_points`
 
-**用 object queries 去读取 encoder 输出的 BEV memory。**
+作用仍然是：
+
+**用 object queries 去读取 encoder 输出的 `bev_feature`，并逐层细化目标位置。**
 
 forward 分成 3 步：
 
 1. object queries 自己做 self-attention
-2. object queries 对 `memory` 做 cross-attention
+2. object queries 围绕当前 `reference_points`，在 `memory` 上做 deformable 采样
 3. FFN
 
 这里的 `memory` 就是 encoder 输出的 `bev_feature`。
+
+你可以把这一层记成：
+
+```text
+object query
+    -> self-attention
+    -> 围绕当前 reference point 在 BEV memory 上稀疏采样
+    -> 得到新的 query
+    -> 交给回归分支去更新 reference point
+```
 
 ### 13.10 `ToyBEVFormer.__init__()`
 
@@ -850,9 +1039,17 @@ forward 分成 3 步：
 2. decoder query 相关参数
    - `self.object_queries`
    - `self.object_query_pos`
+   - `self.reference_point_head`
+   - `self.decoder_layers`
+   - `self.decoder_reg_branches`
 3. 预测头
    - `class_head`
    - `box_head`
+
+和旧版最大的区别是：
+
+- `self.reference_point_head` 先给每个 object query 一个初始 `reference_point`
+- `self.decoder_reg_branches` 负责在每层 decoder 后继续 refine 这些参考点
 
 ### 13.11 `ToyBEVFormer.forward()`
 
@@ -866,15 +1063,17 @@ forward 分成 3 步：
 4. 投影得到 `reference_points_cam + bev_mask`
 5. 初始化 `bev_query`
 6. 走 encoder，得到 `memory`
-7. 准备 object queries
-8. 走 decoder
+7. 准备 object queries 和初始 `reference_points`
+8. 走 decoder，每层都：
+   - 用当前 `reference_points` 做 deformable cross-attention
+   - 用回归分支更新 `reference_points`
 9. 输出：
    - `pred_logits`
    - `pred_boxes`
 
 如果必须用一句话概括这个 `forward()`，那就是：
 
-**先用显式几何生成 reference points，再让 query 围绕这些 reference 做稀疏采样，最后把融合后的 BEV memory 交给 decoder 读出目标。**
+**先用显式几何生成 encoder 侧的 reference points，再让 decoder 里的 object query 围绕自己的 reference point 在 BEV memory 上做稀疏采样，并层层 refine 目标位置。**
 
 ---
 

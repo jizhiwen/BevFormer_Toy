@@ -96,6 +96,14 @@ def masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.
     return weights / denom
 
 
+def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Numerically stable inverse sigmoid used for reference-point refinement."""
+    x = x.clamp(min=0.0, max=1.0)
+    x1 = x.clamp(min=eps)
+    x2 = (1.0 - x).clamp(min=eps)
+    return torch.log(x1 / x2)
+
+
 def sample_from_feature_map(
     feature_map: torch.Tensor,
     sample_points: torch.Tensor,
@@ -484,11 +492,87 @@ class BEVFormerEncoderLayer(nn.Module):
         return query, debug
 
 
+class DeformableDecoderCrossAttention(nn.Module):
+    """
+    Deformable cross-attention over BEV memory.
+
+    Each object query uses a learned 2D reference point on the BEV plane and
+    predicts a small set of offsets around that center.
+    """
+
+    def __init__(
+        self,
+        embed_dims: int,
+        num_heads: int = 8,
+        num_points: int = 4,
+        sampling_radius: float = 0.2,
+    ):
+        super().__init__()
+        assert embed_dims % num_heads == 0
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.num_points = num_points
+        self.sampling_radius = sampling_radius
+
+        self.offset_proj = nn.Linear(embed_dims, num_heads * num_points * 2)
+        self.weight_proj = nn.Linear(embed_dims, num_heads * num_points)
+        self.output_proj = nn.Linear(embed_dims, embed_dims)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        reference_points: torch.Tensor,
+        bev_h: int,
+        bev_w: int,
+        return_debug: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size, num_query, _ = query.shape
+        memory_map = memory.transpose(1, 2).reshape(batch_size, self.embed_dims, bev_h, bev_w)
+
+        offsets = torch.tanh(self.offset_proj(query))
+        offsets = offsets.view(batch_size, num_query, self.num_heads, self.num_points, 2)
+        offsets = offsets * self.sampling_radius
+
+        weights = self.weight_proj(query).view(
+            batch_size,
+            num_query,
+            self.num_heads,
+            self.num_points,
+        )
+        weights = torch.softmax(weights, dim=-1)
+
+        base_refs = reference_points[..., :2].unsqueeze(2).unsqueeze(3)
+        locations = base_refs + offsets
+        sampled = sample_from_feature_map(memory_map, locations, self.num_heads)
+        fused = (sampled * weights.unsqueeze(-1)).sum(dim=3).reshape(batch_size, num_query, self.embed_dims)
+        fused = self.output_proj(fused)
+
+        debug = {}
+        if return_debug:
+            debug = {
+                "sampling_locations": locations.detach(),
+                "attention_weights": weights.detach(),
+            }
+        return fused, debug
+
+
 class DetectionDecoderLayer(nn.Module):
-    def __init__(self, embed_dims: int, num_heads: int, ffn_hidden_dims: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        embed_dims: int,
+        num_heads: int,
+        num_points: int,
+        ffn_hidden_dims: int,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout, batch_first=True)
-        self.cross_attn = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = DeformableDecoderCrossAttention(
+            embed_dims=embed_dims,
+            num_heads=num_heads,
+            num_points=num_points,
+        )
         self.ffn = FeedForward(embed_dims, ffn_hidden_dims, dropout)
 
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -502,6 +586,9 @@ class DetectionDecoderLayer(nn.Module):
         self,
         query: torch.Tensor,
         memory: torch.Tensor,
+        reference_points: torch.Tensor,
+        bev_h: int,
+        bev_w: int,
         query_pos: Optional[torch.Tensor] = None,
         return_debug: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -516,12 +603,13 @@ class DetectionDecoderLayer(nn.Module):
         query = query + self.dropout1(self_out)
 
         q = self.norm2(query + (0 if query_pos is None else query_pos))
-        cross_out, cross_weights = self.cross_attn(
+        cross_out, cross_debug = self.cross_attn(
             q,
             memory,
-            memory,
-            need_weights=return_debug,
-            average_attn_weights=False,
+            reference_points=reference_points,
+            bev_h=bev_h,
+            bev_w=bev_w,
+            return_debug=return_debug,
         )
         query = query + self.dropout2(cross_out)
         query = query + self.dropout3(self.ffn(self.norm3(query)))
@@ -530,7 +618,9 @@ class DetectionDecoderLayer(nn.Module):
         if return_debug:
             debug = {
                 "self_attention_weights": self_weights.detach(),
-                "cross_attention_weights": cross_weights.detach(),
+                "cross_attention_weights": cross_debug["attention_weights"],
+                "cross_sampling_locations": cross_debug["sampling_locations"],
+                "reference_points": reference_points.detach(),
             }
         return query, debug
 
@@ -542,8 +632,9 @@ class ToyBEVFormer(nn.Module):
     Simplifications compared with the official implementation:
     - pure PyTorch, no MMCV custom CUDA ops
     - single-scale image features
-    - no can_bus MLP or box refinement cascade
-    - decoder uses standard attention over BEV memory
+    - no can_bus MLP
+    - decoder uses deformable cross-attention over BEV memory
+    - reference-point refinement is kept, but box parameterization is simplified
     """
 
     def __init__(
@@ -558,6 +649,7 @@ class ToyBEVFormer(nn.Module):
         num_heads: int = 8,
         num_temporal_points: int = 4,
         num_spatial_points: int = 4,
+        num_decoder_points: int = 4,
         num_object_queries: int = 100,
         num_classes: int = 3,
         ffn_hidden_dims: int = 256,
@@ -601,8 +693,20 @@ class ToyBEVFormer(nn.Module):
                 DetectionDecoderLayer(
                     embed_dims=embed_dims,
                     num_heads=num_heads,
+                    num_points=num_decoder_points,
                     ffn_hidden_dims=ffn_hidden_dims,
                     dropout=dropout,
+                )
+                for _ in range(num_decoder_layers)
+            ]
+        )
+        self.reference_point_head = nn.Linear(embed_dims, 3)
+        self.decoder_reg_branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(embed_dims, embed_dims),
+                    nn.ReLU(),
+                    nn.Linear(embed_dims, 7),
                 )
                 for _ in range(num_decoder_layers)
             ]
@@ -685,26 +789,50 @@ class ToyBEVFormer(nn.Module):
         # Decoder reads the fused BEV memory with a fixed set of object queries.
         obj_query = self.object_queries.unsqueeze(0).expand(batch_size, -1, -1)
         obj_query_pos = self.object_query_pos.unsqueeze(0).expand(batch_size, -1, -1)
+        reference_points = self.reference_point_head(obj_query_pos).sigmoid()
 
         decoder_debug = []
         decoded = obj_query
-        for layer in self.decoder_layers:
+        box_deltas = None
+        for lid, layer in enumerate(self.decoder_layers):
             decoded, layer_debug = layer(
                 query=decoded,
                 memory=memory,
+                reference_points=reference_points,
+                bev_h=self.bev_h,
+                bev_w=self.bev_w,
                 query_pos=obj_query_pos,
                 return_debug=return_debug,
             )
+
+            box_deltas = self.decoder_reg_branches[lid](decoded)
+            new_reference_points = torch.zeros_like(reference_points)
+            new_reference_points[..., :2] = (
+                box_deltas[..., :2] + inverse_sigmoid(reference_points[..., :2])
+            )
+            new_reference_points[..., 2:3] = (
+                box_deltas[..., 2:3] + inverse_sigmoid(reference_points[..., 2:3])
+            )
+            new_reference_points = new_reference_points.sigmoid()
+
+            if return_debug:
+                layer_debug["box_deltas"] = box_deltas.detach()
+                layer_debug["updated_reference_points"] = new_reference_points.detach()
             decoder_debug.append(layer_debug)
+            reference_points = new_reference_points.detach()
 
         pred_logits = self.class_head(decoded)
         pred_boxes = self.box_head(decoded)
+        if box_deltas is not None:
+            pred_boxes[..., :2] = reference_points[..., :2]
+            pred_boxes[..., 2:3] = reference_points[..., 2:3]
 
         outputs = {
             "bev_feature": memory,
             "decoder_queries": decoded,
             "pred_logits": pred_logits,
             "pred_boxes": pred_boxes,
+            "decoder_reference_points": reference_points,
             "reference_points_cam": reference_points_cam,
             "bev_mask": bev_mask,
         }
