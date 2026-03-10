@@ -21,6 +21,9 @@
   - 合成一个最小但有规律的 toy 数据集
   - 训练分类头和 3D 框回归头
   - 演示 `prev_bev + image_feats + ego_shift` 如何形成可学习闭环
+- `export_onnx.py`
+  - 从 `.pth` checkpoint 恢复 toy 模型
+  - 导出固定输入签名的 `.onnx`
 - `visualize_toy.py`
   - 把某个 `BEV query` 在相机中的投影点和采样点画出来
   - 生成 `bev_mask` 可见性热力图
@@ -43,6 +46,12 @@ python train_toy.py --epochs 1 --batch-size 4 --train-samples 16 --val-samples 8
 
 ```bash
 python visualize_toy.py --query-idx 210 --camera-idx 0
+```
+
+如果你想把训练得到的 `.pth` 导出为 ONNX：
+
+```bash
+python export_onnx.py --checkpoint toy_bevformer.pth --onnx-path toy_bevformer.onnx
 ```
 
 运行后你会看到：
